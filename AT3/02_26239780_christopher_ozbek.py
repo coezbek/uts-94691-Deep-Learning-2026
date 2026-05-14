@@ -829,7 +829,72 @@ def corpus_bleu(predictions, references_list, max_n=4, smooth=1e-9):
 
 
 # %% [markdown]
-# [7.1] Evaluation pipeline: generate predictions for an image-level loader, compute BLEU, save predictions and metrics.
+# [7.0b] Corpus-level CIDEr-D (Vedantam et al., 2015). Same shape as the
+# `corpus_bleu` above so the comparison table can show both metrics side by side.
+# CIDEr weights n-grams by their inverse document frequency over the reference
+# set, computes the cosine similarity between TF-IDF n-gram vectors of the
+# candidate and each reference, applies a Gaussian length penalty (σ=6), and
+# averages over n=1..4 with a ×10 scale. Implementation is self-contained so the
+# notebook doesn't import any non-shared scoring code.
+
+# %%
+# Self-contained corpus-level CIDEr-D scorer (TF-IDF cosine + length penalty).
+def corpus_cider(predictions, references_list, n_max=4, sigma=6.0):
+    eps = 1e-12
+
+    def ng_list(toks, n):
+        if len(toks) < n:
+            return []
+        return [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+
+    # 1. Document frequency over all reference captions (each ref = one doc).
+    df_count = [Counter() for _ in range(n_max)]
+    num_docs = 0
+    for refs in references_list:
+        for r in refs:
+            num_docs += 1
+            for n in range(1, n_max + 1):
+                for ng in set(ng_list(str(r).split(), n)):
+                    df_count[n - 1][ng] += 1
+    log_num_docs = math.log(max(num_docs, 1))
+
+    def tfidf(tokens, n):
+        counts = Counter(ng_list(tokens, n))
+        total = sum(counts.values())
+        if total == 0:
+            return {}
+        return {ng: (c / total) * (log_num_docs - math.log(max(df_count[n - 1].get(ng, 0), 1)))
+                for ng, c in counts.items()}
+
+    def norm(vec):
+        return math.sqrt(sum(v * v for v in vec.values())) + eps
+
+    scores = []
+    for pred, refs in zip(predictions, references_list):
+        p_tok = str(pred).split()
+        ref_toks = [str(r).split() for r in refs]
+        per_n = []
+        for n in range(1, n_max + 1):
+            p_vec = tfidf(p_tok, n)
+            if not p_vec:
+                per_n.append(0.0); continue
+            sims = []
+            for rt in ref_toks:
+                r_vec = tfidf(rt, n)
+                if not r_vec:
+                    sims.append(0.0); continue
+                common = set(p_vec) & set(r_vec)
+                num = sum(p_vec[ng] * r_vec[ng] for ng in common)
+                cos = num / (norm(p_vec) * norm(r_vec))
+                penalty = math.exp(-((len(p_tok) - len(rt)) ** 2) / (2 * sigma * sigma))
+                sims.append(cos * penalty)
+            per_n.append(10.0 * (sum(sims) / max(len(sims), 1)))
+        scores.append(sum(per_n) / n_max)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+# %% [markdown]
+# [7.1] Evaluation pipeline: generate predictions for an image-level loader, compute BLEU + CIDEr, save predictions and metrics.
 
 # %%
 # Evaluate Model 1 with greedy decoding, save predictions, score corpus BLEU.
@@ -852,7 +917,9 @@ def evaluate(model, loader, split_name, output_prefix):
 
     pred_df = pd.DataFrame(rows)
     metrics = corpus_bleu(predictions, refs_for_bleu)
-    metrics_row = {"model": "EfficientNetB0+Transformer", "split": split_name, **metrics}
+    cider = corpus_cider(predictions, refs_for_bleu)
+    metrics_row = {"model": "EfficientNetB0+Transformer", "split": split_name,
+                   **metrics, "CIDEr": cider}
     metrics_df = pd.DataFrame([metrics_row])
 
     pred_df.to_csv(MODEL_OUTPUT_DIR / f"{output_prefix}_predictions.csv", index=False)
@@ -936,10 +1003,11 @@ def evaluate_beam(model, loader, split_name, output_prefix, beam_width=5, length
 
     pred_df = pd.DataFrame(rows)
     metrics = corpus_bleu(predictions, refs_for_bleu)
+    cider = corpus_cider(predictions, refs_for_bleu)
     metrics_row = {"model": "EfficientNetB0+Transformer",
                    "split": split_name,
                    "decoding": f"beam w={beam_width} lp={length_penalty}",
-                   **metrics}
+                   **metrics, "CIDEr": cider}
     metrics_df = pd.DataFrame([metrics_row])
     pred_df.to_csv(MODEL1_OUTPUT_DIR / f"{output_prefix}_predictions.csv", index=False)
     metrics_df.to_csv(MODEL1_OUTPUT_DIR / f"{output_prefix}_bleu.csv", index=False)
@@ -1391,9 +1459,10 @@ def m2_evaluate(decoder_fn, loader, split_name, decoding_label):
             rows.append({"image_id": int(image_ids[i]), "file_name": file_names[i],
                          "prediction": pred, "references": refs})
     metrics = corpus_bleu(predictions, refs_for_bleu)
+    cider = corpus_cider(predictions, refs_for_bleu)
     metrics_row = {"model": "SigLIP2+SmallTransformer",
                    "split": split_name, "decoding": decoding_label,
-                   **metrics}
+                   **metrics, "CIDEr": cider}
     return pd.DataFrame([metrics_row]), pd.DataFrame(rows)
 
 
@@ -1486,7 +1555,8 @@ def _row(label, source_df, decoding):
     row = source_df.iloc[0].to_dict()
     return {"Model": label, "Decoding": decoding,
             "BLEU-1": row["BLEU-1"], "BLEU-2": row["BLEU-2"],
-            "BLEU-3": row["BLEU-3"], "BLEU-4": row["BLEU-4"]}
+            "BLEU-3": row["BLEU-3"], "BLEU-4": row["BLEU-4"],
+            "CIDEr": row["CIDEr"]}
 
 
 comparison = pd.DataFrame([
